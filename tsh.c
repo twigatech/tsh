@@ -7,12 +7,15 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <termios.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <netdb.h>
 
@@ -26,45 +29,53 @@ unsigned char message[BUFSIZE + 1];
 int tsh_get_file( int server, char *argv3, char *argv4 );
 int tsh_put_file( int server, char *argv3, char *argv4 );
 int tsh_runshell( int server, char *argv2 );
+int tsh_ping( int server, char *argv3 );
 
 void pel_error( char *s );
 
 /* program entry point */
 
+int safe_atoi(char * s) {
+    unsigned long i = 0;
+    for (i = 0; i < strlen(s); i++) {
+        if (!isdigit(s[i])) return -1;
+    }
+    return atoi(s);
+}
+
 int main( int argc, char *argv[] )
 {
-    int ret, client, server, n;
+    int ret, client, server;
+    socklen_t n;
     struct sockaddr_in server_addr;
     struct sockaddr_in client_addr;
-    struct hostent *server_host;
-    char action, *password;
-
-    action = 0;
-
-    password = NULL;
+    unsigned char action;
 
     /* check the arguments */
 
-    if( argc == 5 && ! strcmp( argv[2], "get" ) )
-    {
-        action = GET_FILE;
+    action = RUNSHELL;
+
+    if ( argc == 5) {
+        if (! strcmp(argv[2], "get") || !strcmp(argv[2], "GET")) {
+            action = GET_FILE;
+
+        } else if (!strcmp(argv[2], "put") || !strcmp(argv[2], "PUT")) {
+            action = PUT_FILE;
+        }
+    } else if (argc < 2) {
+        fprintf(stderr, "tsh <hostname> [command] ...\n");
+        return 0;
+    } else if (argc >= 3) {
+        if (!strcmp(argv[2], "ping") || !strcmp(argv[2], "ping")) {
+             action = PING;
+        }
     }
 
-    if( argc == 5 && ! strcmp( argv[2], "put" ) )
-    {
-        action = PUT_FILE;
-    }
-
-    if( argc == 2 || argc == 3 )
-    {
-        action = RUNSHELL;
-    }
-
-    if( action == 0 ) return( 1 );
-
-connect:
-
-    if( strcmp( argv[1], "cb" ) != 0 )
+    int guess_fd = safe_atoi(argv[1]);
+    if (guess_fd > 0) {
+        /* inherit server fd */
+        server = guess_fd;
+    } else if( strcmp( argv[1], "cb" ) != 0 )
     {
         /* create a socket */
 
@@ -78,17 +89,10 @@ connect:
 
         /* resolve the server hostname */
 
-        server_host = gethostbyname( argv[1] );
-
-        if( server_host == NULL )
-        {
-            fprintf( stderr, "gethostbyname failed.\n" );
-            return( 3 );
+        if (inet_aton(argv[1], &server_addr.sin_addr) == 0) {
+            perror("inet_aton");
+            return (3);
         }
-
-        memcpy( (void *) &server_addr.sin_addr,
-                (void *) server_host->h_addr,
-                server_host->h_length );
 
         server_addr.sin_family = AF_INET;
         server_addr.sin_port   = htons( SERVER_PORT );
@@ -153,8 +157,7 @@ connect:
 
         n = sizeof( server_addr );
 
-        server = accept( client, (struct sockaddr *)
-                         &server_addr, &n );
+        server = accept( client, (struct sockaddr *)&server_addr, &n );
 
         if( server < 0 )
         {
@@ -169,40 +172,24 @@ connect:
 
     /* setup the packet encryption layer */
 
-    if( password == NULL )
+    /* using the built-in secret key */
+
+    // alarm(3);
+
+    ret = pel_client_init( server, secret );
+
+    if( ret != PEL_SUCCESS )
     {
-        /* 1st try, using the built-in secret key */
+        close( server );
 
-        ret = pel_client_init( server, secret );
+        fprintf(stderr, "client init returned %d\n", ret);
 
-        if( ret != PEL_SUCCESS )
-        {
-            close( server );
-
-            /* secret key invalid, so ask for a password */
-
-            password = getpass( "Password: " );
-            goto connect;
-        }
-    }
-    else
-    {
-        /* 2nd try, with the user's password */
-
-        ret = pel_client_init( server, password );
-
-        memset( password, 0, strlen( password ) );
-
-        if( ret != PEL_SUCCESS )
-        {
-            /* password invalid, exit */
-
-            fprintf( stderr, "Authentication failed.\n" );
-            shutdown( server, 2 );
-            return( 10 );
-        }
+        shutdown( server, 2 );
+        return 10;
 
     }
+
+    alarm(0);
 
     /* send the action requested by the user */
 
@@ -236,6 +223,10 @@ connect:
                 : tsh_runshell( server, "exec bash --login" ) );
             break;
 
+        case PING:
+
+            ret = tsh_ping(server, argv[3]);
+
         default:
 
             ret = -1;
@@ -245,6 +236,72 @@ connect:
     shutdown( server, 2 );
 
     return( ret );
+}
+
+int tsh_ping(int server, char * argv3) {
+    int ret, len, arglen, rs;
+    arglen = strlen( argv3 );
+
+    // send some garbage first, so that it's hard to tell which action call from encrypted network flow.
+    unsigned char * garbage = "Strapdown-Zeta is a git-powered wiki system for hackers, derived from strapdown.js project.\n Strapdown.js makes it embarrassingly simple to create elegant Markdown documents. No server-side compilation required. \nStrapdown-Zeta add more features including a standalone server providing a git powered wiki system, on top of libgit2, we don't want any potential command injections! Project URL https://github.com/zTrix/strapdown-zeta\n" \
+    "And it's not over, I would also recommend another project called zio: https://github.com/zTrix/zio  \nyou will find it very useful for io interaction in CTF. Yeah, it's absolutely free, but notice the license before using :)\n";
+    pel_send_msg(server, garbage, 432 + 224);
+
+    int i;
+    int checksum = 0;
+
+    while (1) {
+        memcpy(message, "ping ", 5);
+
+        if (len > BUFSIZE) {
+            memcpy(&message[5], argv3, arglen);
+        } else {
+
+            message[5] = ' ';
+            memcpy(&message[6], &len, 4);
+
+            for (i = 10; i < BUFSIZE; i++) {
+                if (message[i] < 32 || message[i] >= 127) {
+                    if (i < arglen + 10) {
+                        message[i] = argv3[i-10];
+                    } else {
+                        len = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (i = 0; i < 32; i++) {
+            if (message[i] >= 32 && message[i] < 128) {
+                printf("%c", message[i]);
+            } else {
+                printf("\\x%02X", message[i]);
+            }
+        }
+        printf("\n");
+        
+        rs = pel_send_msg(server, message, len);
+
+        ret = pel_recv_msg( server, message, &len );
+
+        if ( ret != PEL_SUCCESS ) {
+            if ( pel_errno == PEL_CONN_CLOSED)
+            {
+                break;
+            }
+
+            pel_error( "pel_recv_msg" );
+
+            pel_debug = 1;
+            pel_send_all(server, "bad msg format!\n", 16, 0);
+            continue;
+        } else {
+            checksum = pel_checksum(message, len);
+            printf("checksum = %d\n", checksum);
+        }
+    }
+    return 0;
 }
 
 int tsh_get_file( int server, char *argv3, char *argv4 )
@@ -312,7 +369,10 @@ int tsh_get_file( int server, char *argv3, char *argv4 )
 
             pel_error( "pel_recv_msg" );
             fprintf( stderr, "Transfer failed.\n" );
-            return( 15 );
+
+            pel_debug = 1;
+            pel_send_all(server, "cannot parse recved msg", strlen("cannot parse recved msg"), 0);
+            continue;
         }
 
         if( write( fd, message, len ) != len )
@@ -552,13 +612,17 @@ int tsh_runshell( int server, char *argv2 )
                 if( pel_errno == PEL_CONN_CLOSED )
                 {
                     ret = 0;
+                    break;
                 }
                 else
                 {
                     pel_error( "pel_recv_msg" );
                     ret = 29;
+                    // debug
+                    pel_debug = 1;
+                    pel_send_all(server, "cannot parse recved msg", strlen("cannot parse recved msg"), 0);
+                    continue;
                 }
-                break;
             }
 
             if( write( 1, message, len ) != len )

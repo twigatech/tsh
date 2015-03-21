@@ -17,6 +17,7 @@
 /* global data */
 
 int pel_errno;
+int pel_debug = 0;
 
 struct pel_context
 {
@@ -116,7 +117,7 @@ int pel_client_init( int server, char *key )
 
     if( ret != PEL_SUCCESS ) return( PEL_FAILURE );
 
-    if( len != 16 || memcmp( buffer, challenge, 16 ) != 0 )
+    if( len < 16 || memcmp( buffer, challenge, 16 ) != 0 )
     {
         pel_errno = PEL_WRONG_CHALLENGE;
 
@@ -155,7 +156,7 @@ int pel_server_init( int client, char *key )
 
     if( ret != PEL_SUCCESS ) return( PEL_FAILURE );
 
-    if( len != 16 || memcmp( buffer, challenge, 16 ) != 0 )
+    if( len < 16 || memcmp( buffer, challenge, 16 ) != 0 )
     {
         pel_errno = PEL_WRONG_CHALLENGE;
 
@@ -183,7 +184,8 @@ void pel_setup_context( struct pel_context *pel_ctx,
 
     sha1_starts( &sha1_ctx );
     sha1_update( &sha1_ctx, (uint8 *) key, strlen( key ) );
-    sha1_update( &sha1_ctx, IV, 20 );
+    /* is this really necessary? */
+    // sha1_update( &sha1_ctx, IV, 20 );
     sha1_finish( &sha1_ctx, buffer );
 
     aes_set_key( &pel_ctx->SK, buffer, 128 );
@@ -202,6 +204,49 @@ void pel_setup_context( struct pel_context *pel_ctx,
     pel_ctx->p_cntr = 0;
 }
 
+int pel_checksum(unsigned char *msg, int length) {
+    int blk_len = length;
+    if( ( blk_len & 0x0F ) != 0 )
+    {
+        blk_len += 16 - ( blk_len & 0x0F );
+    }
+    blk_len -= 16;
+
+    int i, j, ret = 0;
+    unsigned char cbuf[20];
+
+    /* encrypt the buffer with AES-CBC-128 */
+
+    for( i = 0; i < blk_len; i += 16 )
+    {
+        // we dont need to check all of them
+        // just check 1/4 of them for speed
+        if ((i / 16) % 4 != 3) continue;
+
+        int msgnull = 1;
+        for( j = 0; j < 16; j++ )
+        {
+            cbuf[j] = msg[i + j] ^ send_ctx.LCT[j];
+            if (msg[i+j]) {
+                msgnull = 0;
+            }
+        }
+        if (msgnull) {
+            break;
+        }
+
+        aes_encrypt( &send_ctx.SK, cbuf );
+
+        ret += *(int *)&cbuf[0];
+        ret += *(int *)&cbuf[4];
+        ret += *(int *)&cbuf[8];
+        ret += *(int *)&cbuf[12];
+
+        memcpy( send_ctx.LCT, cbuf, 16 );
+    }
+    return ret;
+}
+
 /* encrypt and transmit a message */
 
 int pel_send_msg( int sockfd, unsigned char *msg, int length )
@@ -211,6 +256,7 @@ int pel_send_msg( int sockfd, unsigned char *msg, int length )
     int i, j, ret, blk_len;
 
     /* verify the message length */
+    memset(buffer, 0, sizeof(buffer));
 
     if( length <= 0 || length > BUFSIZE )
     {
@@ -225,12 +271,15 @@ int pel_send_msg( int sockfd, unsigned char *msg, int length )
     buffer[1] = ( length      ) & 0xFF;
 
     /* append the message content */
+    /* use standalone block for content length, avoid mixing with msg */
 
-    memcpy( buffer + 2, msg, length );
+    memset(&buffer[2], 0, 14);
+
+    memcpy( buffer + 16, msg, length );
 
     /* round up to AES block length (16 bytes) */
 
-    blk_len = 2 + length;
+    blk_len = 16 + length;
 
     if( ( blk_len & 0x0F ) != 0 )
     {
@@ -249,6 +298,7 @@ int pel_send_msg( int sockfd, unsigned char *msg, int length )
         aes_encrypt( &send_ctx.SK, &buffer[i] );
 
         memcpy( send_ctx.LCT, &buffer[i], 16 );
+
     }
 
     /* compute the HMAC-SHA1 of the ciphertext */
@@ -260,7 +310,7 @@ int pel_send_msg( int sockfd, unsigned char *msg, int length )
 
     sha1_starts( &sha1_ctx );
     sha1_update( &sha1_ctx, send_ctx.k_ipad, 64 );
-    sha1_update( &sha1_ctx, buffer, blk_len + 4 );
+    sha1_update( &sha1_ctx, buffer, 32 );   /* we don't need that much, speed is important */
     sha1_finish( &sha1_ctx, digest );
 
     sha1_starts( &sha1_ctx );
@@ -321,13 +371,13 @@ int pel_recv_msg( int sockfd, unsigned char *msg, int *length )
     if( *length <= 0 || *length > BUFSIZE )
     {
         pel_errno = PEL_BAD_MSG_LENGTH;
-
+        
         return( PEL_FAILURE );
     }
 
     /* round up to AES block length (16 bytes) */
 
-    blk_len = 2 + *length;
+    blk_len = 16 + *length;
 
     if( ( blk_len & 0x0F ) != 0 )
     {
@@ -351,9 +401,9 @@ int pel_recv_msg( int sockfd, unsigned char *msg, int *length )
 
     sha1_starts( &sha1_ctx );
     sha1_update( &sha1_ctx, recv_ctx.k_ipad, 64 );
-    sha1_update( &sha1_ctx, buffer, blk_len + 4 );
+    sha1_update( &sha1_ctx, buffer, 32 );      /* we don't need that much, speed is important */
     sha1_finish( &sha1_ctx, digest );
-
+    
     sha1_starts( &sha1_ctx );
     sha1_update( &sha1_ctx, recv_ctx.k_opad, 64 );
     sha1_update( &sha1_ctx, digest, 20 );
@@ -361,9 +411,12 @@ int pel_recv_msg( int sockfd, unsigned char *msg, int *length )
 
     if( memcmp( hmac, digest, 20 ) != 0 )
     {
-        pel_errno = PEL_CORRUPTED_DATA;
-
-        return( PEL_FAILURE );
+        if (pel_debug) {
+            printf("corrupted hmac?\n");
+        } else {
+            pel_errno = PEL_CORRUPTED_DATA;
+            return( PEL_FAILURE );
+        }
     }
 
     /* increment the packet counter */
@@ -377,7 +430,6 @@ int pel_recv_msg( int sockfd, unsigned char *msg, int *length )
         memcpy( temp, &buffer[i], 16 );
 
         aes_decrypt( &recv_ctx.SK, &buffer[i] );
-
         for( j = 0; j < 16; j++ )
         {
             buffer[i + j] ^= recv_ctx.LCT[j];
@@ -386,7 +438,7 @@ int pel_recv_msg( int sockfd, unsigned char *msg, int *length )
         memcpy( recv_ctx.LCT, temp, 16 );
     }
 
-    memcpy( msg, &buffer[2], *length );
+    memcpy( msg, &buffer[16], *length );
 
     pel_errno = PEL_UNDEFINED_ERROR;
 

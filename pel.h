@@ -14,6 +14,7 @@
 #define PEL_UNDEFINED_ERROR     -6
 
 extern int pel_errno;
+extern int pel_debug;
 
 int pel_client_init( int server, char *key );
 int pel_server_init( int client, char *key );
